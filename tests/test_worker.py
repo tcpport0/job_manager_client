@@ -1,6 +1,7 @@
 import time
 import json
 import pytest
+import threading
 from job_manager_client.worker import start_worker
 from job_manager_client.utils.connections import redis_conn, queue, keydb_conn
 
@@ -122,3 +123,60 @@ def test_job_status_updates():
     assert result is not None, "Result was not stored"
     result_data = json.loads(result)
     assert result_data == {"status": "done"}, "Unexpected result data"
+
+
+def test_background_keepalive():
+    """Test that keepalive messages are sent in parallel with task execution"""
+    
+    def slow_task(params):
+        """Task that takes a few seconds to complete"""
+        time.sleep(2)  # Simulate long-running work
+        return {"status": "done"}
+    
+    # Create and process job
+    job_id = 'test_background_keepalive'
+    job = queue.enqueue(slow_task, args=({},), job_id=job_id)
+    
+    # Start collecting messages in background
+    messages = []
+    message_lock = threading.Lock()
+    
+    def collect_messages():
+        pubsub = redis_conn.pubsub()
+        pubsub.subscribe(f'job:{job_id}')
+        
+        for message in pubsub.listen():
+            if message['type'] == 'message':
+                data = json.loads(message['data'])
+                with message_lock:
+                    messages.append((time.time(), data))
+                
+                # Stop collecting after job completes
+                if data.get('status') == 'COMPLETE':
+                    break
+    
+    # Start message collector thread
+    collector_thread = threading.Thread(target=collect_messages)
+    collector_thread.daemon = True
+    collector_thread.start()
+    
+    # Process the job
+    start_time = time.time()
+    start_worker(slow_task)
+    
+    # Wait for collector to finish
+    collector_thread.join(timeout=3.0)
+    
+    # Analyze messages
+    with message_lock:
+        keepalives = [m for t, m in messages if m.get('keepalive')]
+        
+    # Verify we got regular keepalive messages
+    assert len(keepalives) > 2, "Not enough keepalive messages"
+    
+    # Check message timing
+    timestamps = [t for t, m in messages if m.get('keepalive')]
+    intervals = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps))]
+    
+    # Verify keepalive frequency (allowing some timing variance)
+    assert all(0.4 <= i <= 0.6 for i in intervals), "Keepalive interval outside expected range"
