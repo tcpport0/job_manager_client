@@ -1,7 +1,18 @@
+import time
 import json
 import pytest
-from job_manager_client.worker import process_job
+from job_manager_client.worker import start_worker
 from job_manager_client.utils.connections import redis_conn, queue, keydb_conn
+
+
+def wait_for_condition(condition_func, timeout=5, interval=0.1):
+    """Helper function to wait for a condition with timeout"""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if condition_func():
+            return True
+        time.sleep(interval)
+    return False
 
 
 def test_simple_task():
@@ -13,7 +24,16 @@ def test_simple_task():
     # Create and process job
     job_id = 'test_simple_job'
     job = queue.enqueue(simple_task, args=({},), job_id=job_id)
-    process_job(simple_task, job)
+    
+    # Process the job
+    start_worker(simple_task)
+    
+    # Wait for job completion
+    def check_completion():
+        status = keydb_conn.hget(f'job:{job_id}:status', 'status')
+        return status == 'COMPLETE'
+    
+    assert wait_for_condition(check_completion), "Job did not complete in time"
     
     # Verify result
     result = keydb_conn.hget(f'job:{job_id}:status', 'result')
@@ -32,9 +52,15 @@ def test_error_handling():
     job_id = 'test_job_error'
     job = queue.enqueue(failing_task, args=({},), job_id=job_id)
     
-    # Job should raise error but still record it
-    with pytest.raises(ValueError, match="Test error"):
-        process_job(failing_task, job)
+    # Process the job
+    start_worker(failing_task)
+    
+    # Wait for error to be recorded
+    def check_error():
+        error = keydb_conn.hget(f'job:{job_id}:status', 'error')
+        return error is not None
+    
+    assert wait_for_condition(check_error), "Error was not recorded in time"
     
     # Verify error was recorded
     error = keydb_conn.hget(f'job:{job_id}:status', 'error')
@@ -53,13 +79,22 @@ def test_large_result_handling():
     # Create and process job
     job_id = 'test_large_result'
     job = queue.enqueue(large_result_task, args=({},), job_id=job_id)
-    process_job(large_result_task, job)
+    
+    # Process the job
+    start_worker(large_result_task)
+    
+    # Wait for job completion
+    def check_completion():
+        status = keydb_conn.hget(f'job:{job_id}:status', 'status')
+        return status == 'COMPLETE'
+    
+    assert wait_for_condition(check_completion), "Job did not complete in time"
     
     # Verify large result was stored
     result = keydb_conn.hget(f'job:{job_id}:status', 'result')
     assert result is not None, "Result was not stored"
     result_data = json.loads(result)
-    assert len(result_data['data']) == 2000000, "Large result not stored correctly"
+    assert len(result_data['data']) == 2000000, "Result data size incorrect"
 
 
 def test_job_status_updates():
@@ -71,13 +106,19 @@ def test_job_status_updates():
     # Create and process job
     job_id = 'test_status'
     job = queue.enqueue(status_task, args=({},), job_id=job_id)
-    process_job(status_task, job)
+    
+    # Process the job
+    start_worker(status_task)
+    
+    # Wait for job completion
+    def check_completion():
+        status = keydb_conn.hget(f'job:{job_id}:status', 'status')
+        return status == 'COMPLETE'
+    
+    assert wait_for_condition(check_completion), "Job did not complete in time"
     
     # Verify final status
-    status = keydb_conn.hget(f'job:{job_id}:status', 'status')
-    assert status == 'COMPLETE', "Job status not updated correctly"
-    
-    # Verify result
     result = keydb_conn.hget(f'job:{job_id}:status', 'result')
+    assert result is not None, "Result was not stored"
     result_data = json.loads(result)
-    assert result_data == {"status": "done"}, "Unexpected result"
+    assert result_data == {"status": "done"}, "Unexpected result data"

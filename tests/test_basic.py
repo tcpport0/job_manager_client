@@ -1,7 +1,18 @@
+import time
 import json
 import pytest
-from job_manager_client.worker import process_job
+from job_manager_client.worker import start_worker
 from job_manager_client.utils.connections import redis_conn, queue, keydb_conn
+
+
+def wait_for_condition(condition_func, timeout=5, interval=0.1):
+    """Helper function to wait for a condition with timeout"""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if condition_func():
+            return True
+        time.sleep(interval)
+    return False
 
 
 def test_basic_job_processing():
@@ -10,10 +21,19 @@ def test_basic_job_processing():
     def basic_task(params):
         return {"status": "completed"}
     
-    # Create and process job
+    # Create and enqueue a job
     job_id = 'test_basic_job'
-    job = queue.enqueue(basic_task, args=({},), job_id=job_id)
-    process_job(basic_task, job)
+    job = queue.enqueue(basic_task, job_id=job_id, args=({},))
+    
+    # Process the job
+    start_worker(basic_task)
+    
+    # Wait for job completion
+    def check_completion():
+        status = keydb_conn.hget(f'job:{job_id}:status', 'status')
+        return status == 'COMPLETE'
+    
+    assert wait_for_condition(check_completion), "Job did not complete in time"
     
     # Verify the result
     result = keydb_conn.hget(f'job:{job_id}:status', 'result')
@@ -28,11 +48,20 @@ def test_job_with_parameters():
     def param_task(params):
         return {"received": params}
     
-    # Create and process job
+    # Create and enqueue a job with parameters
     job_id = 'test_param_job'
     test_params = {"key": "value"}
-    job = queue.enqueue(param_task, args=(test_params,), job_id=job_id)
-    process_job(param_task, job)
+    job = queue.enqueue(param_task, job_id=job_id, args=(test_params,))
+    
+    # Process the job
+    start_worker(param_task)
+    
+    # Wait for job completion
+    def check_completion():
+        status = keydb_conn.hget(f'job:{job_id}:status', 'status')
+        return status == 'COMPLETE'
+    
+    assert wait_for_condition(check_completion), "Job did not complete in time"
     
     # Verify the result
     result = keydb_conn.hget(f'job:{job_id}:status', 'result')
@@ -47,13 +76,19 @@ def test_simple_error_handling():
     def error_task(params):
         raise ValueError("Test error")
     
-    # Create and process job
+    # Create and enqueue a job
     job_id = 'test_error_job'
-    job = queue.enqueue(error_task, args=({},), job_id=job_id)
+    job = queue.enqueue(error_task, job_id=job_id, args=({},))
     
-    # Job should raise error but still record it
-    with pytest.raises(ValueError, match="Test error"):
-        process_job(error_task, job)
+    # Process the job
+    start_worker(error_task)
+    
+    # Wait for job completion (will be error)
+    def check_error():
+        error = keydb_conn.hget(f'job:{job_id}:status', 'error')
+        return error is not None
+    
+    assert wait_for_condition(check_error), "Error was not recorded in time"
     
     # Verify the error
     error = keydb_conn.hget(f'job:{job_id}:status', 'error')
