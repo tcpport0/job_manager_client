@@ -1,0 +1,5 @@
+redis
+rq
+pytest
+python-dotenv
+pytest-timeout
